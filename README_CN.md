@@ -198,7 +198,7 @@ checkpoint_dir/assets/<policy.repo_id>/norm_stats.json
 | `pi05_tron2_cloth` | `cloth` |
 | `pi05_tron2_drawer` | `drawer` |
 | `pi05_tron2_duck` | `duck` |
-| `pi05_tron2_sortFruit` | `sort` |
+| `pi05_tron2_sort` | `sort` |
 
 ### 启动策略服务
 

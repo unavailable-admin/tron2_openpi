@@ -649,7 +649,7 @@ def _tron2_checkpoint_task_configs() -> list[TrainConfig]:
         _tron2_task_config("pi05_tron2_cloth", "cloth", "Perform the TRON2 cloth task"),
         _tron2_task_config("pi05_tron2_drawer", "drawer", "Perform the TRON2 drawer task"),
         _tron2_task_config("pi05_tron2_duck", "duck", "Perform the TRON2 duck task"),
-        _tron2_task_config("pi05_tron2_sortFruit", "sort", "Perform the TRON2 sort fruit task"),
+        _tron2_task_config("pi05_tron2_sort", "sort", "Perform the TRON2 sort fruit task"),
     ]
 
 

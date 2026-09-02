@@ -12,7 +12,7 @@ from openpi.training import config
         ("pi05_tron2_cloth", "cloth"),
         ("pi05_tron2_drawer", "drawer"),
         ("pi05_tron2_duck", "duck"),
-        ("pi05_tron2_sortFruit", "sort"),
+        ("pi05_tron2_sort", "sort"),
     ],
 )
 def test_task_configs_use_lowercase_initial(config_name: str, repo_id: str):
