@@ -109,7 +109,10 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
+        # "reduce-overhead" keeps CUDA graphs but skips max-autotune's GEMM
+        # search; on Jetson Thor inductor reports no Triton GEMM candidates
+        # (num_triton_choices: 0), so the search only costs compile time.
+        self.sample_actions = torch.compile(self.sample_actions, mode="reduce-overhead")
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
