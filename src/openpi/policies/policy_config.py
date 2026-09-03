@@ -22,6 +22,7 @@ def create_trained_policy(
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
     pytorch_device: str | None = None,
+    tensorrt_engine: pathlib.Path | str | None = None,
 ) -> _policy.Policy:
     """Create a policy from a trained checkpoint.
 
@@ -37,6 +38,10 @@ def create_trained_policy(
             from the checkpoint directory.
         pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda", "cuda:0").
                       If None and is_pytorch=True, will use "cuda" if available, otherwise "cpu".
+        tensorrt_engine: Path to a TensorRT engine exported from the PyTorch checkpoint in
+                      checkpoint_dir. When given, sample_actions runs on the engine
+                      (openpi.models_pytorch.pi0_tensorrt.PI0TensorRT) instead of the PyTorch
+                      model; norm stats, transforms and metadata still come from checkpoint_dir.
 
     Note:
         The function automatically detects whether the model is PyTorch-based by checking for the
@@ -50,7 +55,17 @@ def create_trained_policy(
     is_pytorch = os.path.exists(weight_path)
 
     logging.info("Loading model...")
-    if is_pytorch:
+    if tensorrt_engine is not None:
+        if not is_pytorch:
+            raise ValueError(
+                f"tensorrt_engine requires the PyTorch checkpoint layout (model.safetensors) in {checkpoint_dir}; "
+                "the engine is exported from and validated against that checkpoint"
+            )
+        # Deferred: the tensorrt Python bindings exist only on the Thor deployment image.
+        from openpi.models_pytorch import pi0_tensorrt
+
+        model = pi0_tensorrt.PI0TensorRT(train_config.model, tensorrt_engine, pytorch_device or "cuda")
+    elif is_pytorch:
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
     else:
