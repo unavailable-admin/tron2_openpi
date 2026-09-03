@@ -108,7 +108,8 @@ class Policy(BasePolicy):
         # Prepare RTC kwargs.
         if inference_delay is not None:
             if self._is_pytorch_model:
-                sample_kwargs["inference_delay"] = inference_delay
+                # Use a tensor to avoid torch.compile recompilation on different Python int values
+                sample_kwargs["inference_delay"] = torch.tensor(inference_delay, device=self._pytorch_device)
             else:
                 # Use jnp.array to avoid recompilation on different Python int values
                 sample_kwargs["inference_delay"] = jnp.array(inference_delay)
@@ -136,7 +137,7 @@ class Policy(BasePolicy):
                 sample_kwargs["max_guidance_weight"] = float(max_guidance_weight)
             else:
                 sample_kwargs["max_guidance_weight"] = jnp.array(max_guidance_weight, dtype=jnp.float32)
-        if trained_rtc_mode and not self._is_pytorch_model:
+        if trained_rtc_mode:
             sample_kwargs["trained_rtc_mode"] = True
 
         observation = _model.Observation.from_dict(inputs)

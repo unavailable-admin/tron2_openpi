@@ -274,10 +274,23 @@ class PI0Pytorch(nn.Module):
             # Set attention masks so that image and language inputs do not attend to state or actions
             att_masks += [1]
 
-        # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
-        )
+        # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1].
+        # timestep is either (b,) or, for trained-RTC inference, per-token (b, H).
+        if timestep.ndim == 1:
+            time_emb = create_sinusoidal_pos_embedding(
+                timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0, device=timestep.device
+            )
+        elif timestep.ndim == 2:
+            batch_size, horizon = timestep.shape
+            time_emb = create_sinusoidal_pos_embedding(
+                timestep.reshape(-1),
+                self.action_in_proj.out_features,
+                min_period=4e-3,
+                max_period=4.0,
+                device=timestep.device,
+            ).reshape(batch_size, horizon, self.action_in_proj.out_features)
+        else:
+            raise ValueError(f"timestep must have shape (b,) or (b, H); got {tuple(timestep.shape)}")
         time_emb = time_emb.type(dtype=timestep.dtype)
 
         # Fuse timestep + action information using an MLP
@@ -287,7 +300,8 @@ class PI0Pytorch(nn.Module):
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
         if not self.pi05:
-            time_emb = time_emb[:, None, :].expand_as(action_emb)
+            if timestep.ndim == 1:
+                time_emb = time_emb[:, None, :].expand_as(action_emb)
             action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
             # Apply MLP layers
@@ -299,7 +313,17 @@ class PI0Pytorch(nn.Module):
             action_time_emb = self._apply_checkpoint(mlp_func, action_time_emb)
             adarms_cond = None
         else:
-            # time MLP (for adaRMS)
+            # time MLP (for adaRMS). adaRMS conditioning is per batch element; with
+            # per-token time the JAX model uses the mean over tokens.
+            if timestep.ndim == 2:
+                time_emb = create_sinusoidal_pos_embedding(
+                    timestep.mean(dim=-1),
+                    self.action_in_proj.out_features,
+                    min_period=4e-3,
+                    max_period=4.0,
+                    device=timestep.device,
+                ).type(dtype=timestep.dtype)
+
             def time_mlp_func(time_emb):
                 x = self.time_mlp_in(time_emb)
                 x = F.silu(x)  # swish == silu
@@ -387,8 +411,26 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+    def sample_actions(
+        self,
+        device,
+        observation,
+        noise=None,
+        num_steps=10,
+        *,
+        prev_chunk_left_over=None,
+        prev_chunk_left_over_len=None,
+        inference_delay=0,
+        prefix_horizon=None,
+        max_guidance_weight=None,
+        trained_rtc_mode=False,
+    ) -> Tensor:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors).
+
+        RTC keyword arguments mirror the JAX ``Pi0.sample_actions``. Only the
+        trained-RTC path (``trained_rtc_mode=True``) is implemented; inference-time
+        VJP guidance raises ``NotImplementedError`` instead of silently degrading.
+        """
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
@@ -412,6 +454,16 @@ class PI0Pytorch(nn.Module):
             use_cache=True,
         )
 
+        if prev_chunk_left_over is not None:
+            if not trained_rtc_mode:
+                raise NotImplementedError(
+                    "Inference-time RTC guidance (VJP) is not implemented for the PyTorch model; "
+                    "use trained_rtc_mode=True with a checkpoint trained with rtc_training_simulated_delay."
+                )
+            return self._sample_actions_trained_rtc(
+                device, state, prefix_pad_masks, past_key_values, noise, num_steps, prev_chunk_left_over, inference_delay
+            )
+
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
@@ -430,6 +482,48 @@ class PI0Pytorch(nn.Module):
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
+        return x_t
+
+    def _sample_actions_trained_rtc(
+        self,
+        device,
+        state,
+        prefix_pad_masks,
+        past_key_values,
+        noise,
+        num_steps,
+        prev_chunk_left_over,
+        inference_delay,
+    ) -> Tensor:
+        """Trained-RTC inference, ported from the JAX ``Pi0._sample_actions_trained_rtc``.
+
+        The first ``inference_delay`` action positions are held at the previous
+        chunk's actions with per-token time 0 (clean); the remaining positions
+        are denoised normally. ``inference_delay`` may be an int or a scalar
+        tensor; passing a tensor avoids torch.compile recompiling per value.
+        """
+        bsize, action_horizon, action_dim = noise.shape
+        prev_chunk_left_over = prev_chunk_left_over.to(device=device, dtype=noise.dtype)
+        if prev_chunk_left_over.shape[1] < action_horizon:
+            padded = torch.zeros_like(noise)
+            padded[:, : prev_chunk_left_over.shape[1], :] = prev_chunk_left_over
+            prev_chunk_left_over = padded
+
+        inference_delay = torch.as_tensor(inference_delay, device=device)
+        committed_mask = torch.arange(action_horizon, device=device)[None, :] < inference_delay  # (1, H)
+        committed_mask_3d = committed_mask[:, :, None]
+        zero_time = torch.zeros(bsize, action_horizon, dtype=torch.float32, device=device)
+
+        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        for _ in range(num_steps):
+            x_t = torch.where(committed_mask_3d, prev_chunk_left_over, x_t)
+            time_per_token = torch.where(committed_mask, zero_time, time.expand(bsize, action_horizon))
+            v_t = self.denoise_step(state, prefix_pad_masks, past_key_values, x_t, time_per_token)
+            x_t = x_t + dt * v_t
+            x_t = torch.where(committed_mask_3d, prev_chunk_left_over, x_t)
+            time = time + dt
         return x_t
 
     def denoise_step(
