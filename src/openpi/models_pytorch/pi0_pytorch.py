@@ -148,6 +148,16 @@ class PI0Pytorch(nn.Module):
         """Check if gradient checkpointing is enabled."""
         return self.gradient_checkpointing_enabled
 
+    # The JAX BaseModel exposes these as dataclass fields; serve_policy.py reads
+    # them from the model for server metadata and for the warmup chunk shape.
+    @property
+    def action_horizon(self) -> int:
+        return self.config.action_horizon
+
+    @property
+    def action_dim(self) -> int:
+        return self.config.action_dim
+
     def _apply_checkpoint(self, func, *args, **kwargs):
         """Helper method to apply gradient checkpointing if enabled."""
         if self.gradient_checkpointing_enabled and self.training:
