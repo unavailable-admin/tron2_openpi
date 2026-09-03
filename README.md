@@ -164,6 +164,7 @@ Server fields:
 | `policy.config` | Training config name registered in `src/openpi/training/config.py`. |
 | `policy.repo_id` | Asset directory name used to load normalization statistics. |
 | `policy.checkpoint_dir` | Path to the trained checkpoint step directory. |
+| `policy.tensorrt_engine` | Optional TensorRT engine exported from the PyTorch checkpoint in `checkpoint_dir`; `sample_actions` then runs on the engine (`openpi.models_pytorch.pi0_tensorrt`). |
 | `policy.default_prompt` | Default language instruction when the client does not pass `--prompt`. |
 | `policy.record` | Saves raw policy inputs/outputs for debugging when `true`. |
 | `policy.action_horizon` | Optional inference action chunk length override. |

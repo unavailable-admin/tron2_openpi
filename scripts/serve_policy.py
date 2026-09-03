@@ -217,6 +217,9 @@ def create_policy(args: Args, config_profile: dict) -> _policy.Policy:
         case Default():
             config_name = policy_profile.get("config")
             checkpoint_dir = policy_profile.get("checkpoint_dir") or policy_profile.get("dir")
+            # Optional TensorRT engine exported from the PyTorch checkpoint in
+            # checkpoint_dir; sample_actions then runs on the engine.
+            tensorrt_engine = policy_profile.get("tensorrt_engine")
             if config_name or checkpoint_dir:
                 if not config_name or not checkpoint_dir:
                     raise ValueError("YAML policy config requires both policy.config and policy.checkpoint_dir")
@@ -231,6 +234,7 @@ def create_policy(args: Args, config_profile: dict) -> _policy.Policy:
                     train_config,
                     str(checkpoint_dir),
                     default_prompt=default_prompt,
+                    tensorrt_engine=str(tensorrt_engine) if tensorrt_engine else None,
                 )
             return create_default_policy(args.env, default_prompt=default_prompt)
 

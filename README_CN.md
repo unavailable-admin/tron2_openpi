@@ -153,6 +153,7 @@ server 字段：
 | `policy.config` | `src/openpi/training/config.py` 中注册的训练配置名。 |
 | `policy.repo_id` | 用于加载归一化统计的 assets 目录名。 |
 | `policy.checkpoint_dir` | 训练好的 checkpoint step 目录。 |
+| `policy.tensorrt_engine` | 可选，由 `checkpoint_dir` 中的 PyTorch checkpoint 导出的 TensorRT engine；给出时 `sample_actions` 在 engine 上运行（`openpi.models_pytorch.pi0_tensorrt`）。 |
 | `policy.default_prompt` | 客户端未传 `--prompt` 时使用的默认语言指令。 |
 | `policy.record` | 为 `true` 时保存原始 policy 输入/输出，用于调试。 |
 | `policy.action_horizon` | 可选的推理 action chunk 长度覆盖项。 |
