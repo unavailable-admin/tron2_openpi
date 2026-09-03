@@ -153,10 +153,24 @@ class PI0Pytorch(nn.Module):
             )
         return func(*args, **kwargs)
 
+    def _attention_dtype(self) -> torch.dtype:
+        """Dtype of the attention queries, taken from the projection weights."""
+        vlm_dtype = self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
+        expert_dtype = self.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight.dtype
+        if vlm_dtype != expert_dtype:
+            raise RuntimeError(f"PaliGemma and action expert attention dtypes differ: {vlm_dtype} vs {expert_dtype}")
+        return expert_dtype
+
     def _prepare_attention_masks_4d(self, att_2d_masks):
-        """Helper method to prepare 4D attention masks for transformer."""
+        """Helper method to prepare 4D attention masks for transformer.
+
+        The additive mask is materialised in the query dtype. torch.compile
+        (inductor) fuses the eager matmul/softmax attention into
+        scaled_dot_product_attention, whose memory-efficient kernel rejects a
+        float32 bias against bfloat16 queries ("invalid dtype for bias").
+        """
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38).to(self._attention_dtype())
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
