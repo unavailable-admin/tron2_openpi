@@ -9,6 +9,9 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.ttt_fast_weight import TTTConfig
+from openpi.models_pytorch.ttt_fast_weight import TTTFastWeightStack
+from openpi.models_pytorch.ttt_fast_weight import TTTRequest
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -96,6 +99,8 @@ class PI0Pytorch(nn.Module):
             use_adarms=[False, True] if self.pi05 else [False, False],
             precision=config.dtype,
         )
+        self._action_expert_config = action_expert_config
+        self.ttt_fast_weight_stack: TTTFastWeightStack | None = None
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
@@ -147,6 +152,34 @@ class PI0Pytorch(nn.Module):
     def is_gradient_checkpointing_enabled(self):
         """Check if gradient checkpointing is enabled."""
         return self.gradient_checkpointing_enabled
+
+    def enable_ttt_deploy_simulation(self, config: TTTConfig | None = None) -> TTTFastWeightStack:
+        """Attach the deterministic TTT cost model after checkpoint loading.
+
+        This API is intentionally separate from ``sample_actions`` so serving
+        and WebSocket inference cannot accidentally retain fast state.
+        """
+        effective_config = config or TTTConfig.from_action_expert_config(self._action_expert_config)
+        if effective_config.width != self._action_expert_config.width:
+            raise ValueError(
+                f"TTT width {effective_config.width} does not match action expert width "
+                f"{self._action_expert_config.width}"
+            )
+        if effective_config.layer_count != self._action_expert_config.depth:
+            raise ValueError(
+                f"TTT layer count {effective_config.layer_count} does not match action expert depth "
+                f"{self._action_expert_config.depth}"
+            )
+        reference_weight = self.paligemma_with_expert.gemma_expert.model.layers[0].self_attn.q_proj.weight
+        stack = TTTFastWeightStack(effective_config).to(
+            device=reference_weight.device,
+            dtype=reference_weight.dtype,
+        )
+        stack.eval()
+        stack.requires_grad_(False)
+        self.ttt_fast_weight_stack = stack
+        self.requires_grad_(False)
+        return stack
 
     # The JAX BaseModel exposes these as dataclass fields; serve_policy.py reads
     # them from the model for server metadata and for the warmup chunk shape.
@@ -497,6 +530,61 @@ class PI0Pytorch(nn.Module):
             time += dt
         return x_t
 
+    @torch.no_grad()
+    def sample_actions_ttt(
+        self,
+        device,
+        observation,
+        ttt_request: TTTRequest,
+        noise=None,
+        num_steps=10,
+    ) -> Tensor:
+        """Run the deployment-only TTT simulation on a fixed offline request."""
+        if self.ttt_fast_weight_stack is None:
+            raise RuntimeError("Call enable_ttt_deploy_simulation() before sample_actions_ttt()")
+        if ttt_request.session.stack is not self.ttt_fast_weight_stack:
+            raise ValueError("TTT request belongs to a different fast-weight stack")
+
+        bsize = observation.state.shape[0]
+        if noise is None:
+            actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
+            noise = self.sample_noise(actions_shape, device)
+
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+
+        dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
+        x_t = noise
+        time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        for pass_index in range(num_steps):
+            ttt_request.begin_denoise_pass(pass_index)
+            expanded_time = time.expand(bsize)
+            v_t = self.denoise_step(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                x_t,
+                expanded_time,
+                ttt_request=ttt_request,
+            )
+            x_t = x_t + dt * v_t
+            time = time + dt
+        ttt_request.finish()
+        return x_t
+
     def _sample_actions_trained_rtc(
         self,
         device,
@@ -546,6 +634,7 @@ class PI0Pytorch(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        ttt_request: TTTRequest | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, timestep)
@@ -574,6 +663,7 @@ class PI0Pytorch(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=False,
             adarms_cond=[None, adarms_cond],
+            ttt_request=ttt_request,
         )
 
         suffix_out = outputs_embeds[1]

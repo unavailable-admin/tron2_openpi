@@ -8,6 +8,8 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from openpi.models_pytorch.ttt_fast_weight import TTTRequest
+
 
 class PaliGemmaWithExpertModel(nn.Module):
     def __init__(
@@ -88,6 +90,63 @@ class PaliGemmaWithExpertModel(nn.Module):
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)
 
+    def _forward_suffix_ttt(
+        self,
+        *,
+        attention_mask: torch.Tensor,
+        position_ids: torch.LongTensor,
+        past_key_values,
+        inputs_embeds: torch.Tensor,
+        adarms_cond: torch.Tensor | None,
+        ttt_request: TTTRequest,
+    ) -> torch.Tensor:
+        model = self.gemma_expert.model
+        hidden_states = inputs_embeds
+        if model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            hidden_states = hidden_states.to(torch.bfloat16)
+
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        cache_position = torch.arange(
+            past_seen_tokens,
+            past_seen_tokens + hidden_states.shape[1],
+            device=hidden_states.device,
+        )
+        causal_mask = modeling_gemma.create_causal_mask(
+            config=model.config,
+            input_embeds=hidden_states,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+        position_embeddings = model.rotary_emb(hidden_states, position_ids)
+
+        for layer_index, decoder_layer in enumerate(model.layers[: model.config.num_hidden_layers]):
+            residual = hidden_states
+            hidden_states, attention_gate = decoder_layer.input_layernorm(hidden_states, adarms_cond)
+            hidden_states, _ = decoder_layer.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=False,
+                use_cache=False,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+            hidden_states = modeling_gemma._gated_residual(  # noqa: SLF001
+                residual, hidden_states, attention_gate
+            )
+            hidden_states = ttt_request.process_layer(layer_index, hidden_states)
+
+            residual = hidden_states
+            hidden_states, mlp_gate = decoder_layer.post_attention_layernorm(hidden_states, adarms_cond)
+            hidden_states = decoder_layer.mlp(hidden_states)
+            hidden_states = modeling_gemma._gated_residual(residual, hidden_states, mlp_gate)  # noqa: SLF001
+
+        hidden_states, _ = model.norm(hidden_states, adarms_cond)
+        return hidden_states
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -96,6 +155,7 @@ class PaliGemmaWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] | None = None,
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
+        ttt_request: TTTRequest | None = None,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -112,15 +172,25 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            suffix_output = self.gemma_expert.model.forward(
-                inputs_embeds=inputs_embeds[1],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
-            )
-            suffix_output = suffix_output.last_hidden_state
+            if ttt_request is None:
+                suffix_output = self.gemma_expert.model.forward(
+                    inputs_embeds=inputs_embeds[1],
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+                )
+                suffix_output = suffix_output.last_hidden_state
+            else:
+                suffix_output = self._forward_suffix_ttt(
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds[1],
+                    adarms_cond=adarms_cond[1],
+                    ttt_request=ttt_request,
+                )
             prefix_output = None
             prefix_past_key_values = None
         else:
