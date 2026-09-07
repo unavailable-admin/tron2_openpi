@@ -163,8 +163,6 @@ class TTTFastWeightLayer(nn.Module):
             (parameter - self.config.inner_learning_rate * gradient).detach()
             for parameter, gradient in zip(differentiable_state.tensors(), gradients, strict=True)
         )
-        if not all(torch.isfinite(tensor).all().item() for tensor in updated_tensors):
-            raise FloatingPointError(f"Non-finite fast weights in TTT layer {self.layer_index}")
         return FastWeightLayerState(*updated_tensors)
 
     def apply(
@@ -179,8 +177,6 @@ class TTTFastWeightLayer(nn.Module):
         fast_output = self._fast_forward(queries, state)[:, : hidden_states.shape[1]]
         gate = torch.zeros_like(self.gate) if gate_zero else self.gate
         output = hidden_states + torch.tanh(gate) * fast_output
-        if not torch.isfinite(output).all().item():
-            raise FloatingPointError(f"Non-finite output in TTT layer {self.layer_index}")
         return output.detach()
 
 
@@ -217,6 +213,9 @@ class TTTSession:
     def reset(self) -> None:
         self.states = self.stack.initial_states()
         self.last_updated_observation_id = None
+
+    def all_finite(self) -> bool:
+        return all(torch.isfinite(tensor).all().item() for state in self.states for tensor in state.tensors())
 
     def start_request(
         self,
