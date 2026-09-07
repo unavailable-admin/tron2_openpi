@@ -102,7 +102,6 @@ class TTTFastWeightLayer(nn.Module):
         generator.manual_seed(self.config.initialization_seed + self.layer_index)
         projection_bound = 1.0 / math.sqrt(self.config.width)
         fast_first_bound = 1.0 / math.sqrt(self.config.width)
-        fast_second_bound = 1.0 / math.sqrt(self.config.fast_hidden_size)
         for projection in (self.query_projection, self.key_projection, self.value_projection):
             nn.init.uniform_(projection.weight, -projection_bound, projection_bound, generator=generator)
             projection.weight.requires_grad_(False)
@@ -110,9 +109,10 @@ class TTTFastWeightLayer(nn.Module):
             self.initial_first_weight, -fast_first_bound, fast_first_bound, generator=generator
         )
         nn.init.zeros_(self.initial_first_bias)
-        nn.init.uniform_(
-            self.initial_second_weight, -fast_second_bound, fast_second_bound, generator=generator
-        )
+        # A zero output projection gives the untrained branch an exact zero
+        # residual before its first inner update and avoids arbitrary recurrent
+        # amplification in the conservative every-pass-update simulation.
+        nn.init.zeros_(self.initial_second_weight)
         nn.init.zeros_(self.initial_second_bias)
         if self.config.register_tokens:
             nn.init.normal_(
