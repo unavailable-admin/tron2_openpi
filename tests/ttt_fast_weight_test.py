@@ -88,7 +88,7 @@ def test_layer_states_are_independent_and_reset_is_reproducible() -> None:
     )
     request.process_layer(0, torch.randn(1, 3, 8))
 
-    assert not torch.equal(session.states[0].first_weight, initial_first_layer.first_weight)
+    assert not torch.equal(session.states[0].second_weight, initial_first_layer.second_weight)
     torch.testing.assert_close(session.states[1].first_weight, initial_second_layer.first_weight)
     assert session.states[0].first_weight.data_ptr() != session.states[1].first_weight.data_ptr()
 
