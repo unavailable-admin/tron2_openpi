@@ -102,6 +102,7 @@ class PI0Pytorch(nn.Module):
         self._action_expert_config = action_expert_config
         self.ttt_fast_weight_stack: TTTFastWeightStack | None = None
         self._compiled_ttt_denoise_step = None
+        self._compiled_ttt_prefix = None
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
@@ -184,9 +185,21 @@ class PI0Pytorch(nn.Module):
         stack.eval()
         stack.requires_grad_(False)
         self.ttt_fast_weight_stack = stack
+        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
         self._compiled_ttt_denoise_step = (
             torch.compile(
                 self.denoise_step_ttt_functional,
+                mode="default",
+                fullgraph=True,
+                dynamic=False,
+            )
+            if compile_denoise_step
+            else None
+        )
+        self._compiled_ttt_prefix = (
+            torch.compile(
+                self.compute_ttt_prefix,
                 mode="default",
                 fullgraph=True,
                 dynamic=False,
@@ -567,19 +580,12 @@ class PI0Pytorch(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
+        prefix_runner = self._compiled_ttt_prefix or self.compute_ttt_prefix
+        prefix_pad_masks, past_key_values = prefix_runner(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
         )
 
         dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
@@ -611,6 +617,29 @@ class PI0Pytorch(nn.Module):
         ttt_request.session.replace_flat_states(fast_states)
         ttt_request.finish()
         return x_t
+
+    def compute_ttt_prefix(
+        self,
+        images: list[torch.Tensor],
+        img_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+    ):
+        """Build the prefix KV cache without touching TTT session state."""
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks
+        )
+        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+        _, past_key_values = self.paligemma_with_expert.forward(
+            attention_mask=prefix_att_2d_masks_4d,
+            position_ids=prefix_position_ids,
+            past_key_values=None,
+            inputs_embeds=[prefix_embs, None],
+            use_cache=True,
+        )
+        return prefix_pad_masks, past_key_values
 
     def _sample_actions_trained_rtc(
         self,
