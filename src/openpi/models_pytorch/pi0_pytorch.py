@@ -103,6 +103,7 @@ class PI0Pytorch(nn.Module):
         self.ttt_fast_weight_stack: TTTFastWeightStack | None = None
         self._compiled_ttt_denoise_step = None
         self._compiled_ttt_prefix = None
+        self._ttt_prefix_tensorrt = None
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
@@ -160,6 +161,7 @@ class PI0Pytorch(nn.Module):
         config: TTTConfig | None = None,
         *,
         compile_denoise_step: bool = False,
+        prefix_tensorrt_engine=None,
     ) -> TTTFastWeightStack:
         """Attach the deterministic TTT cost model after checkpoint loading.
 
@@ -204,9 +206,20 @@ class PI0Pytorch(nn.Module):
                 fullgraph=True,
                 dynamic=False,
             )
-            if compile_denoise_step
+            if compile_denoise_step and prefix_tensorrt_engine is None
             else None
         )
+        if prefix_tensorrt_engine is None:
+            self._ttt_prefix_tensorrt = None
+        else:
+            # TensorRT is optional for the ordinary PyTorch/TTT path.
+            from openpi.models_pytorch.pi0_tensorrt import PI0PrefixTensorRT
+
+            self._ttt_prefix_tensorrt = PI0PrefixTensorRT(
+                self.config,
+                prefix_tensorrt_engine,
+                reference_weight.device,
+            )
         self.requires_grad_(False)
         return stack
 
@@ -580,7 +593,7 @@ class PI0Pytorch(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
-        prefix_runner = self._compiled_ttt_prefix or self.compute_ttt_prefix
+        prefix_runner = self._ttt_prefix_tensorrt or self._compiled_ttt_prefix or self.compute_ttt_prefix
         prefix_pad_masks, past_key_values = prefix_runner(
             images,
             img_masks,

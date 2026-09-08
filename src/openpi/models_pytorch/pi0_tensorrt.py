@@ -20,6 +20,7 @@ import pathlib
 import tensorrt as trt
 import torch
 from torch import nn
+from transformers.cache_utils import DynamicCache
 
 from openpi.models_pytorch.preprocessing_pytorch import IMAGE_KEYS
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
@@ -37,6 +38,9 @@ ENGINE_INPUT_NAMES = (
 )
 ENGINE_OUTPUT_NAME = "actions"
 ENGINE_METADATA_FORMAT = "tron2-pi05-tensorrt/1"
+PREFIX_ENGINE_METADATA_FORMAT = "tron2-pi05-prefix-tensorrt/1"
+PREFIX_ENGINE_INPUT_NAMES = ("images", "img_masks", "lang_tokens", "lang_masks")
+PREFIX_PAD_MASKS_OUTPUT = "prefix_pad_masks"
 
 _TRT_TO_TORCH_DTYPE = {
     trt.DataType.FLOAT: torch.float32,
@@ -84,12 +88,15 @@ def engine_metadata_path(engine_path: pathlib.Path) -> pathlib.Path:
     return engine_path.with_name(engine_path.name + ".json")
 
 
-def load_engine_metadata(engine_path: pathlib.Path) -> dict:
+def load_engine_metadata(
+    engine_path: pathlib.Path,
+    expected_format: str = ENGINE_METADATA_FORMAT,
+) -> dict:
     metadata_path = engine_metadata_path(engine_path)
     if not metadata_path.is_file():
         raise FileNotFoundError(f"TensorRT engine metadata not found: {metadata_path}")
     metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if metadata.get("format") != ENGINE_METADATA_FORMAT:
+    if metadata.get("format") != expected_format:
         raise ValueError(f"Unsupported engine metadata format {metadata.get('format')!r} in {metadata_path}")
     return metadata
 
@@ -181,6 +188,90 @@ class TensorRTEngine:
             output = self._buffers[ENGINE_OUTPUT_NAME].clone()
         self._stream.synchronize()
         return output
+
+    def run_zero_copy(self, **inputs: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Enqueue and expose persistent outputs after a caller-stream dependency."""
+        if set(inputs) != set(self.inputs):
+            raise ValueError(f"Engine inputs {sorted(self.inputs)} != provided {sorted(inputs)}")
+        for name, tensor in inputs.items():
+            spec = self.inputs[name]
+            if tuple(tensor.shape) != spec.shape or tensor.dtype != spec.dtype:
+                raise ValueError(
+                    f"Engine input {name} expects {list(spec.shape)} {spec.dtype}, "
+                    f"got {list(tensor.shape)} {tensor.dtype}"
+                )
+        caller_stream = torch.cuda.current_stream(self.device)
+        self._stream.wait_stream(caller_stream)
+        with torch.cuda.stream(self._stream):
+            for name, tensor in inputs.items():
+                self._buffers[name].copy_(tensor, non_blocking=True)
+            if self._graph is None:
+                self._graph = self._capture_graph()
+            self._graph.replay()
+        caller_stream.wait_stream(self._stream)
+        return {name: self._buffers[name] for name in self.outputs}
+
+
+class PI0PrefixTensorRT:
+    """Prefix-only TensorRT runtime returning zero-copy masks and DynamicCache."""
+
+    def __init__(self, config, engine_path: pathlib.Path | str, device: torch.device | str):
+        self.config = config
+        self.engine_path = pathlib.Path(engine_path)
+        self.device = torch.device(device)
+        self.metadata = load_engine_metadata(
+            self.engine_path,
+            expected_format=PREFIX_ENGINE_METADATA_FORMAT,
+        )
+        self.engine = TensorRTEngine(self.engine_path, self.device)
+        self.layer_count = int(self.metadata["layer_count"])
+        self._check_contract()
+        logger.info("%s", self.engine.describe())
+
+    def _check_contract(self) -> None:
+        expected_metadata = {
+            "max_token_len": int(self.config.max_token_len),
+            "num_views": len(IMAGE_KEYS),
+            "tensorrt_version": trt.__version__,
+        }
+        mismatches = [
+            f"{key}: engine {self.metadata.get(key)!r} != config {value!r}"
+            for key, value in expected_metadata.items()
+            if self.metadata.get(key) != value
+        ]
+        expected_outputs = [PREFIX_PAD_MASKS_OUTPUT]
+        for layer_index in range(self.layer_count):
+            expected_outputs.extend((f"prefix_key_{layer_index}", f"prefix_value_{layer_index}"))
+        if tuple(self.engine.inputs) != PREFIX_ENGINE_INPUT_NAMES:
+            mismatches.append(f"inputs: {tuple(self.engine.inputs)!r} != {PREFIX_ENGINE_INPUT_NAMES!r}")
+        if tuple(self.engine.outputs) != tuple(expected_outputs):
+            mismatches.append(f"outputs: {tuple(self.engine.outputs)!r} != {tuple(expected_outputs)!r}")
+        if mismatches:
+            raise ValueError(f"Prefix TensorRT engine {self.engine_path} contract mismatch: " + "; ".join(mismatches))
+
+    def __call__(
+        self,
+        images: list[torch.Tensor],
+        img_masks: list[torch.Tensor],
+        lang_tokens: torch.Tensor,
+        lang_masks: torch.Tensor,
+    ) -> tuple[torch.Tensor, DynamicCache]:
+        flat_images = torch.cat(images, dim=1).to(device=self.device, dtype=torch.float32)
+        flat_masks = torch.stack(img_masks, dim=1).to(device=self.device, dtype=torch.bool)
+        outputs = self.engine.run_zero_copy(
+            images=flat_images,
+            img_masks=flat_masks,
+            lang_tokens=lang_tokens.to(device=self.device, dtype=torch.int64),
+            lang_masks=lang_masks.to(device=self.device, dtype=torch.bool),
+        )
+        cache = DynamicCache()
+        for layer_index in range(self.layer_count):
+            cache.update(
+                outputs[f"prefix_key_{layer_index}"],
+                outputs[f"prefix_value_{layer_index}"],
+                layer_index,
+            )
+        return outputs[PREFIX_PAD_MASKS_OUTPUT], cache
 
 
 class PI0TensorRT(nn.Module):
