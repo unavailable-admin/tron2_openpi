@@ -15,6 +15,13 @@ import torch
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
+FastWeightTensors = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+FAST_HIDDEN_ABLATION_RATIOS: tuple[tuple[str, float], ...] = (
+    ("hidden_4096_equivalent", 1.0),
+    ("hidden_2048_equivalent", 0.5),
+    ("hidden_1024_equivalent", 0.25),
+)
+
 
 class TTTUpdateMode(enum.StrEnum):
     APPLY_ONLY = "apply_only"
@@ -31,6 +38,7 @@ class TTTConfig:
     inner_learning_rate: float = 0.1
     gate_init: float = 0.001
     initialization_seed: int = 20260907
+    fast_state_dtype: str = "model"
 
     @classmethod
     def from_action_expert_config(cls, action_expert_config: object) -> "TTTConfig":
@@ -40,6 +48,16 @@ class TTTConfig:
             layer_count=int(action_expert_config.depth),
         )
 
+    @classmethod
+    def for_hidden_ratio(cls, action_expert_config: object, ratio: float) -> "TTTConfig":
+        if ratio not in {candidate_ratio for _, candidate_ratio in FAST_HIDDEN_ABLATION_RATIOS}:
+            raise ValueError(f"Unsupported fast-hidden ratio: {ratio}")
+        config = cls.from_action_expert_config(action_expert_config)
+        return dataclasses.replace(
+            config,
+            fast_hidden_size=max(1, round(config.fast_hidden_size * ratio)),
+        )
+
     def validate(self) -> None:
         if self.width <= 0 or self.fast_hidden_size <= 0 or self.layer_count <= 0:
             raise ValueError("TTT dimensions and layer count must be positive")
@@ -47,6 +65,8 @@ class TTTConfig:
             raise ValueError("TTT register token count must be non-negative")
         if self.inner_learning_rate <= 0:
             raise ValueError("TTT inner learning rate must be positive")
+        if self.fast_state_dtype not in {"model", "float32"}:
+            raise ValueError("fast_state_dtype must be 'model' or 'float32'")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,17 +76,60 @@ class FastWeightLayerState:
     second_weight: torch.Tensor
     second_bias: torch.Tensor
 
-    def tensors(self) -> tuple[torch.Tensor, ...]:
+    def tensors(self) -> FastWeightTensors:
         return (self.first_weight, self.first_bias, self.second_weight, self.second_bias)
 
     def detached_clone(self) -> "FastWeightLayerState":
         return FastWeightLayerState(*(tensor.detach().clone() for tensor in self.tensors()))
 
 
+def fast_mlp_forward(
+    tokens: torch.Tensor,
+    first_weight: torch.Tensor,
+    first_bias: torch.Tensor,
+    second_weight: torch.Tensor,
+    second_bias: torch.Tensor,
+) -> torch.Tensor:
+    hidden = F.gelu(F.linear(tokens, first_weight, first_bias))
+    return F.linear(hidden, second_weight, second_bias)
+
+
+def fast_mlp_loss(
+    first_weight: torch.Tensor,
+    first_bias: torch.Tensor,
+    second_weight: torch.Tensor,
+    second_bias: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+) -> torch.Tensor:
+    predictions = fast_mlp_forward(keys, first_weight, first_bias, second_weight, second_bias)
+    return F.mse_loss(predictions.float(), values.float())
+
+
+fast_mlp_grad = torch.func.grad(fast_mlp_loss, argnums=(0, 1, 2, 3))
+
+
+def update_fast_state(
+    state: FastWeightTensors,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    learning_rate: float,
+) -> FastWeightTensors:
+    state_dtype = state[0].dtype
+    keys = keys.to(state_dtype)
+    values = values.to(state_dtype)
+    gradients = fast_mlp_grad(*state, keys, values)
+    return tuple(
+        (parameter - learning_rate * gradient).detach()
+        for parameter, gradient in zip(state, gradients, strict=True)
+    )
+
+
 @dataclasses.dataclass
 class TTTTiming:
     update_event_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]] = dataclasses.field(default_factory=list)
     apply_event_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]] = dataclasses.field(default_factory=list)
+    functional_event_pairs: list[tuple[torch.cuda.Event, torch.cuda.Event]] = dataclasses.field(default_factory=list)
     update_count: int = 0
     apply_count: int = 0
 
@@ -74,6 +137,9 @@ class TTTTiming:
         return {
             "update_cuda_ms": float(sum(start.elapsed_time(end) for start, end in self.update_event_pairs)),
             "apply_cuda_ms": float(sum(start.elapsed_time(end) for start, end in self.apply_event_pairs)),
+            "functional_suffix_cuda_ms": float(
+                sum(start.elapsed_time(end) for start, end in self.functional_event_pairs)
+            ),
         }
 
 
@@ -123,18 +189,19 @@ class TTTFastWeightLayer(nn.Module):
             )
 
     def initial_state(self) -> FastWeightLayerState:
-        return FastWeightLayerState(
+        state = FastWeightLayerState(
             self.initial_first_weight.detach().clone(),
             self.initial_first_bias.detach().clone(),
             self.initial_second_weight.detach().clone(),
             self.initial_second_bias.detach().clone(),
         )
+        if self.config.fast_state_dtype == "float32":
+            return FastWeightLayerState(*(tensor.float() for tensor in state.tensors()))
+        return state
 
     @staticmethod
     def _fast_forward(tokens: torch.Tensor, state: FastWeightLayerState) -> torch.Tensor:
-        hidden = F.linear(tokens, state.first_weight, state.first_bias)
-        hidden = F.gelu(hidden)
-        return F.linear(hidden, state.second_weight, state.second_bias)
+        return fast_mlp_forward(tokens, *state.tensors())
 
     def _tokens_with_registers(self, hidden_states: torch.Tensor, use_register_tokens: bool) -> torch.Tensor:
         if not use_register_tokens or self.config.register_tokens == 0:
@@ -152,18 +219,9 @@ class TTTFastWeightLayer(nn.Module):
         with torch.no_grad():
             keys = self.key_projection(tokens).detach()
             values = self.value_projection(tokens).detach()
-        differentiable_state = FastWeightLayerState(
-            *(tensor.detach().requires_grad_(True) for tensor in state.tensors())
+        return FastWeightLayerState(
+            *update_fast_state(state.tensors(), keys, values, self.config.inner_learning_rate)
         )
-        with torch.enable_grad():
-            predictions = self._fast_forward(keys, differentiable_state)
-            loss = F.mse_loss(predictions.float(), values.float())
-            gradients = torch.autograd.grad(loss, differentiable_state.tensors(), create_graph=False)
-        updated_tensors = tuple(
-            (parameter - self.config.inner_learning_rate * gradient).detach()
-            for parameter, gradient in zip(differentiable_state.tensors(), gradients, strict=True)
-        )
-        return FastWeightLayerState(*updated_tensors)
 
     def apply(
         self,
@@ -174,10 +232,38 @@ class TTTFastWeightLayer(nn.Module):
     ) -> torch.Tensor:
         tokens = self._tokens_with_registers(hidden_states, use_register_tokens)
         queries = self.query_projection(tokens)
-        fast_output = self._fast_forward(queries, state)[:, : hidden_states.shape[1]]
+        apply_state = tuple(tensor.to(queries.dtype) for tensor in state.tensors())
+        fast_output = fast_mlp_forward(queries, *apply_state)[:, : hidden_states.shape[1]]
         gate = torch.zeros_like(self.gate) if gate_zero else self.gate
         output = hidden_states + torch.tanh(gate) * fast_output
         return output.detach()
+
+    def update_apply_tensors(
+        self,
+        hidden_states: torch.Tensor,
+        state: FastWeightTensors,
+        use_register_tokens: bool,
+        gate_zero: bool,
+    ) -> tuple[torch.Tensor, FastWeightTensors]:
+        tokens = self._tokens_with_registers(hidden_states, use_register_tokens)
+        keys = self.key_projection(tokens).detach()
+        values = self.value_projection(tokens).detach()
+        new_state = update_fast_state(state, keys, values, self.config.inner_learning_rate)
+        return self.apply_only_tensors(hidden_states, new_state, use_register_tokens, gate_zero), new_state
+
+    def apply_only_tensors(
+        self,
+        hidden_states: torch.Tensor,
+        state: FastWeightTensors,
+        use_register_tokens: bool,
+        gate_zero: bool,
+    ) -> torch.Tensor:
+        tokens = self._tokens_with_registers(hidden_states, use_register_tokens)
+        queries = self.query_projection(tokens)
+        apply_state = tuple(tensor.to(queries.dtype) for tensor in state)
+        fast_output = fast_mlp_forward(queries, *apply_state)[:, : hidden_states.shape[1]]
+        gate = torch.zeros_like(self.gate) if gate_zero else self.gate
+        return (hidden_states + torch.tanh(gate) * fast_output).detach()
 
 
 class TTTFastWeightStack(nn.Module):
@@ -216,6 +302,18 @@ class TTTSession:
 
     def all_finite(self) -> bool:
         return all(torch.isfinite(tensor).all().item() for state in self.states for tensor in state.tensors())
+
+    def flat_states(self) -> tuple[torch.Tensor, ...]:
+        return tuple(tensor for state in self.states for tensor in state.tensors())
+
+    def replace_flat_states(self, tensors: tuple[torch.Tensor, ...]) -> None:
+        expected = self.stack.config.layer_count * 4
+        if len(tensors) != expected:
+            raise ValueError(f"Expected {expected} fast-state tensors, got {len(tensors)}")
+        self.states = [
+            FastWeightLayerState(*tensors[index : index + 4])
+            for index in range(0, expected, 4)
+        ]
 
     def start_request(
         self,
@@ -275,6 +373,26 @@ class TTTRequest:
         if self.mode == TTTUpdateMode.UPDATE_ONCE:
             return self.denoise_pass_index == 0
         return True
+
+    def should_update(self) -> bool:
+        """Return the graph-external update decision for the current pass."""
+        return self._should_update()
+
+    def record_functional_pass(self, updated: bool) -> None:
+        if updated:
+            self.timing.update_count += self.layer_limit
+        self.timing.apply_count += self.layer_limit
+
+    def begin_functional_pass_timing(self) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
+        return self._event_pair()
+
+    def finish_functional_pass_timing(
+        self,
+        event_pair: tuple[torch.cuda.Event, torch.cuda.Event] | None,
+    ) -> None:
+        self._finish_event(event_pair)
+        if event_pair is not None:
+            self.timing.functional_event_pairs.append(event_pair)
 
     def _event_pair(self) -> tuple[torch.cuda.Event, torch.cuda.Event] | None:
         if not self.record_cuda_timing:

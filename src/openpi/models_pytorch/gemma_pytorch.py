@@ -8,6 +8,8 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
+from openpi.models_pytorch.ttt_fast_weight import FastWeightTensors
+from openpi.models_pytorch.ttt_fast_weight import TTTFastWeightStack
 from openpi.models_pytorch.ttt_fast_weight import TTTRequest
 
 
@@ -147,6 +149,80 @@ class PaliGemmaWithExpertModel(nn.Module):
         hidden_states, _ = model.norm(hidden_states, adarms_cond)
         return hidden_states
 
+    def _forward_suffix_ttt_functional(
+        self,
+        *,
+        attention_mask: torch.Tensor,
+        position_ids: torch.LongTensor,
+        past_key_values,
+        inputs_embeds: torch.Tensor,
+        adarms_cond: torch.Tensor | None,
+        ttt_stack: TTTFastWeightStack,
+        fast_states: tuple[torch.Tensor, ...],
+        update_fast_weights: bool,
+        layer_limit: int,
+        use_register_tokens: bool,
+        gate_zero: bool,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        model = self.gemma_expert.model
+        hidden_states = inputs_embeds
+        if model.layers[0].self_attn.q_proj.weight.dtype == torch.bfloat16:
+            hidden_states = hidden_states.to(torch.bfloat16)
+
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        cache_position = torch.arange(
+            past_seen_tokens,
+            past_seen_tokens + hidden_states.shape[1],
+            device=hidden_states.device,
+        )
+        causal_mask = modeling_gemma.create_causal_mask(
+            config=model.config,
+            input_embeds=hidden_states,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
+        position_embeddings = model.rotary_emb(hidden_states, position_ids)
+        output_states: list[torch.Tensor] = []
+
+        for layer_index, decoder_layer in enumerate(model.layers[: model.config.num_hidden_layers]):
+            residual = hidden_states
+            hidden_states, attention_gate = decoder_layer.input_layernorm(hidden_states, adarms_cond)
+            hidden_states, _ = decoder_layer.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=causal_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_values,
+                output_attentions=False,
+                use_cache=False,
+                cache_position=cache_position,
+                position_embeddings=position_embeddings,
+            )
+            hidden_states = modeling_gemma._gated_residual(residual, hidden_states, attention_gate)  # noqa: SLF001
+
+            state_offset = layer_index * 4
+            layer_state: FastWeightTensors = fast_states[state_offset : state_offset + 4]
+            if layer_index < layer_limit:
+                ttt_layer = ttt_stack.layers[layer_index]
+                if update_fast_weights:
+                    hidden_states, layer_state = ttt_layer.update_apply_tensors(
+                        hidden_states, layer_state, use_register_tokens, gate_zero
+                    )
+                else:
+                    hidden_states = ttt_layer.apply_only_tensors(
+                        hidden_states, layer_state, use_register_tokens, gate_zero
+                    )
+            output_states.extend(layer_state)
+
+            residual = hidden_states
+            hidden_states, mlp_gate = decoder_layer.post_attention_layernorm(hidden_states, adarms_cond)
+            hidden_states = decoder_layer.mlp(hidden_states)
+            hidden_states = modeling_gemma._gated_residual(residual, hidden_states, mlp_gate)  # noqa: SLF001
+
+        hidden_states, _ = model.norm(hidden_states, adarms_cond)
+        return hidden_states, tuple(output_states)
+
     def forward(
         self,
         attention_mask: torch.Tensor | None = None,
@@ -156,6 +232,12 @@ class PaliGemmaWithExpertModel(nn.Module):
         use_cache: bool | None = None,
         adarms_cond: list[torch.Tensor] | None = None,
         ttt_request: TTTRequest | None = None,
+        ttt_stack: TTTFastWeightStack | None = None,
+        fast_states: tuple[torch.Tensor, ...] | None = None,
+        update_fast_weights: bool = False,
+        ttt_layer_limit: int = 0,
+        use_ttt_register_tokens: bool = False,
+        ttt_gate_zero: bool = False,
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
@@ -172,7 +254,23 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            if ttt_request is None:
+            if fast_states is not None:
+                if ttt_stack is None:
+                    raise ValueError("ttt_stack is required with fast_states")
+                suffix_output, fast_states = self._forward_suffix_ttt_functional(
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds[1],
+                    adarms_cond=adarms_cond[1],
+                    ttt_stack=ttt_stack,
+                    fast_states=fast_states,
+                    update_fast_weights=update_fast_weights,
+                    layer_limit=ttt_layer_limit,
+                    use_register_tokens=use_ttt_register_tokens,
+                    gate_zero=ttt_gate_zero,
+                )
+            elif ttt_request is None:
                 suffix_output = self.gemma_expert.model.forward(
                     inputs_embeds=inputs_embeds[1],
                     attention_mask=attention_mask,
@@ -348,4 +446,6 @@ class PaliGemmaWithExpertModel(nn.Module):
             suffix_output = outputs_embeds[1]
             prefix_past_key_values = None
 
+        if fast_states is not None:
+            return [prefix_output, suffix_output], prefix_past_key_values, fast_states
         return [prefix_output, suffix_output], prefix_past_key_values

@@ -101,6 +101,7 @@ class PI0Pytorch(nn.Module):
         )
         self._action_expert_config = action_expert_config
         self.ttt_fast_weight_stack: TTTFastWeightStack | None = None
+        self._compiled_ttt_denoise_step = None
 
         self.action_in_proj = nn.Linear(32, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, 32)
@@ -153,7 +154,12 @@ class PI0Pytorch(nn.Module):
         """Check if gradient checkpointing is enabled."""
         return self.gradient_checkpointing_enabled
 
-    def enable_ttt_deploy_simulation(self, config: TTTConfig | None = None) -> TTTFastWeightStack:
+    def enable_ttt_deploy_simulation(
+        self,
+        config: TTTConfig | None = None,
+        *,
+        compile_denoise_step: bool = False,
+    ) -> TTTFastWeightStack:
         """Attach the deterministic TTT cost model after checkpoint loading.
 
         This API is intentionally separate from ``sample_actions`` so serving
@@ -178,6 +184,16 @@ class PI0Pytorch(nn.Module):
         stack.eval()
         stack.requires_grad_(False)
         self.ttt_fast_weight_stack = stack
+        self._compiled_ttt_denoise_step = (
+            torch.compile(
+                self.denoise_step_ttt_functional,
+                mode="default",
+                fullgraph=True,
+                dynamic=False,
+            )
+            if compile_denoise_step
+            else None
+        )
         self.requires_grad_(False)
         return stack
 
@@ -569,19 +585,30 @@ class PI0Pytorch(nn.Module):
         dt = torch.tensor(-1.0 / num_steps, dtype=torch.float32, device=device)
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        fast_states = ttt_request.session.flat_states()
+        denoise_step = self._compiled_ttt_denoise_step or self.denoise_step_ttt_functional
         for pass_index in range(num_steps):
             ttt_request.begin_denoise_pass(pass_index)
             expanded_time = time.expand(bsize)
-            v_t = self.denoise_step(
+            update_fast_weights = ttt_request.should_update()
+            functional_events = ttt_request.begin_functional_pass_timing()
+            v_t, fast_states = denoise_step(
                 state,
                 prefix_pad_masks,
                 past_key_values,
                 x_t,
                 expanded_time,
-                ttt_request=ttt_request,
+                fast_states,
+                update_fast_weights,
+                ttt_request.layer_limit,
+                ttt_request.use_register_tokens,
+                ttt_request.gate_zero,
             )
+            ttt_request.finish_functional_pass_timing(functional_events)
+            ttt_request.record_functional_pass(update_fast_weights)
             x_t = x_t + dt * v_t
             time = time + dt
+        ttt_request.session.replace_flat_states(fast_states)
         ttt_request.finish()
         return x_t
 
@@ -670,3 +697,49 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
+    def denoise_step_ttt_functional(
+        self,
+        state: torch.Tensor,
+        prefix_pad_masks: torch.Tensor,
+        past_key_values,
+        x_t: torch.Tensor,
+        timestep: torch.Tensor,
+        fast_states: tuple[torch.Tensor, ...],
+        update_fast_weights: bool,
+        layer_limit: int,
+        use_register_tokens: bool,
+        gate_zero: bool,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        """Pure Tensor TTT suffix step; session state and counters stay outside the graph."""
+        if self.ttt_fast_weight_stack is None:
+            raise RuntimeError("TTT stack is not enabled")
+        suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(
+            state, x_t, timestep
+        )
+        suffix_len = suffix_pad_masks.shape[1]
+        batch_size = prefix_pad_masks.shape[0]
+        prefix_len = prefix_pad_masks.shape[1]
+        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+
+        outputs_embeds, _, output_states = self.paligemma_with_expert.forward(
+            attention_mask=full_att_2d_masks_4d,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=[None, suffix_embs],
+            use_cache=False,
+            adarms_cond=[None, adarms_cond],
+            ttt_stack=self.ttt_fast_weight_stack,
+            fast_states=fast_states,
+            update_fast_weights=update_fast_weights,
+            ttt_layer_limit=layer_limit,
+            use_ttt_register_tokens=use_register_tokens,
+            ttt_gate_zero=gate_zero,
+        )
+        suffix_out = outputs_embeds[1][:, -self.config.action_horizon :].to(dtype=torch.float32)
+        return self.action_out_proj(suffix_out), output_states

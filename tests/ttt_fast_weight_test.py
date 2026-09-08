@@ -1,9 +1,13 @@
+import dataclasses
+
 import torch
 
 from openpi.models_pytorch.ttt_fast_weight import TTTConfig
 from openpi.models_pytorch.ttt_fast_weight import TTTFastWeightStack
 from openpi.models_pytorch.ttt_fast_weight import TTTSession
 from openpi.models_pytorch.ttt_fast_weight import TTTUpdateMode
+from openpi.models_pytorch.ttt_fast_weight import fast_mlp_forward
+from openpi.models_pytorch.ttt_fast_weight import update_fast_state
 
 
 def make_stack() -> TTTFastWeightStack:
@@ -15,6 +19,17 @@ def make_stack() -> TTTFastWeightStack:
             register_tokens=2,
             initialization_seed=7,
         )
+    )
+
+
+def autograd_reference_update(state, keys, values, learning_rate):
+    differentiable = tuple(tensor.detach().requires_grad_(True) for tensor in state)
+    predictions = fast_mlp_forward(keys, *differentiable)
+    loss = torch.nn.functional.mse_loss(predictions.float(), values.float())
+    gradients = torch.autograd.grad(loss, differentiable)
+    return tuple(
+        (parameter - learning_rate * gradient).detach()
+        for parameter, gradient in zip(differentiable, gradients, strict=True)
     )
 
 
@@ -73,6 +88,55 @@ def test_every_pass_updates_each_layer() -> None:
     assert request.timing.update_count == 6
     assert request.timing.apply_count == 6
     assert torch.isfinite(hidden).all()
+
+
+def test_five_step_every_pass_counts_90_updates_and_applies() -> None:
+    stack = TTTFastWeightStack(
+        TTTConfig(width=8, fast_hidden_size=16, layer_count=18, register_tokens=2)
+    )
+    request = TTTSession(stack).start_request(
+        "observation-0",
+        TTTUpdateMode.EVERY_PASS,
+        18,
+        use_register_tokens=True,
+    )
+    hidden = torch.randn(1, 3, 8)
+    for pass_index in range(5):
+        request.begin_denoise_pass(pass_index)
+        for layer_index in range(18):
+            hidden = request.process_layer(layer_index, hidden)
+    assert request.timing.update_count == 90
+    assert request.timing.apply_count == 90
+
+
+def test_functional_grad_matches_autograd_and_compiles() -> None:
+    layer = make_stack().layers[0]
+    hidden = torch.randn(1, 3, 8)
+    tokens = layer._tokens_with_registers(hidden, True)  # noqa: SLF001
+    keys = layer.key_projection(tokens).detach()
+    values = layer.value_projection(tokens).detach()
+    state = layer.initial_state().tensors()
+    expected = autograd_reference_update(state, keys, values, layer.config.inner_learning_rate)
+    actual = update_fast_state(state, keys, values, layer.config.inner_learning_rate)
+    for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+
+    compiled_update = torch.compile(update_fast_state, backend="eager", fullgraph=True)
+    compiled = compiled_update(state, keys, values, layer.config.inner_learning_rate)
+    for compiled_tensor, expected_tensor in zip(compiled, expected, strict=True):
+        torch.testing.assert_close(compiled_tensor, expected_tensor)
+
+
+def test_flat_tensor_state_threading_and_fp32_master() -> None:
+    config = dataclasses.replace(make_stack().config, fast_state_dtype="float32")
+    stack = TTTFastWeightStack(config).to(dtype=torch.bfloat16)
+    session = TTTSession(stack)
+    flat_states = session.flat_states()
+    assert all(tensor.dtype == torch.float32 for tensor in flat_states)
+    replacements = tuple(tensor + 1 for tensor in flat_states)
+    session.replace_flat_states(replacements)
+    for actual, expected in zip(session.flat_states(), replacements, strict=True):
+        torch.testing.assert_close(actual, expected)
 
 
 def test_layer_states_are_independent_and_reset_is_reproducible() -> None:
