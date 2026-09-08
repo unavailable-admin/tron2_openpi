@@ -21,8 +21,6 @@ LowRankFastWeightTensors = tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
 ]
 FastStateTensors = tuple[torch.Tensor, ...]
 FAST_HIDDEN_ABLATION_RATIOS: tuple[tuple[str, float], ...] = (
@@ -99,19 +97,15 @@ class FastWeightLayerState:
 class LowRankFastWeightLayerState:
     first_left: torch.Tensor
     first_right: torch.Tensor
-    first_bias_delta: torch.Tensor
     second_left: torch.Tensor
     second_right: torch.Tensor
-    second_bias_delta: torch.Tensor
 
     def tensors(self) -> LowRankFastWeightTensors:
         return (
             self.first_left,
             self.first_right,
-            self.first_bias_delta,
             self.second_left,
             self.second_right,
-            self.second_bias_delta,
         )
 
     def detached_clone(self) -> "LowRankFastWeightLayerState":
@@ -168,31 +162,29 @@ def low_rank_fast_mlp_forward(
     base_second_bias: torch.Tensor,
     first_left: torch.Tensor,
     first_right: torch.Tensor,
-    first_bias_delta: torch.Tensor,
     second_left: torch.Tensor,
     second_right: torch.Tensor,
-    second_bias_delta: torch.Tensor,
+    low_rank_scale: float,
 ) -> torch.Tensor:
-    hidden = F.linear(tokens, base_first_weight, base_first_bias + first_bias_delta)
-    hidden = hidden + F.linear(F.linear(tokens, first_right), first_left)
+    hidden = F.linear(tokens, base_first_weight, base_first_bias)
+    hidden = hidden + low_rank_scale * F.linear(F.linear(tokens, first_right), first_left)
     hidden = F.gelu(hidden)
-    output = F.linear(hidden, base_second_weight, base_second_bias + second_bias_delta)
-    return output + F.linear(F.linear(hidden, second_right), second_left)
+    output = F.linear(hidden, base_second_weight, base_second_bias)
+    return output + low_rank_scale * F.linear(F.linear(hidden, second_right), second_left)
 
 
 def low_rank_fast_mlp_loss(
     first_left: torch.Tensor,
     first_right: torch.Tensor,
-    first_bias_delta: torch.Tensor,
     second_left: torch.Tensor,
     second_right: torch.Tensor,
-    second_bias_delta: torch.Tensor,
     keys: torch.Tensor,
     values: torch.Tensor,
     base_first_weight: torch.Tensor,
     base_first_bias: torch.Tensor,
     base_second_weight: torch.Tensor,
     base_second_bias: torch.Tensor,
+    low_rank_scale: float,
 ) -> torch.Tensor:
     predictions = low_rank_fast_mlp_forward(
         keys,
@@ -202,15 +194,14 @@ def low_rank_fast_mlp_loss(
         base_second_bias,
         first_left,
         first_right,
-        first_bias_delta,
         second_left,
         second_right,
-        second_bias_delta,
+        low_rank_scale,
     )
     return F.mse_loss(predictions.float(), values.float())
 
 
-low_rank_fast_mlp_grad = torch.func.grad(low_rank_fast_mlp_loss, argnums=(0, 1, 2, 3, 4, 5))
+low_rank_fast_mlp_grad = torch.func.grad(low_rank_fast_mlp_loss, argnums=(0, 1, 2, 3))
 
 
 def update_low_rank_fast_state(
@@ -224,7 +215,14 @@ def update_low_rank_fast_state(
     keys = keys.to(state_dtype)
     values = values.to(state_dtype)
     typed_base_state = tuple(tensor.to(state_dtype) for tensor in base_state)
-    gradients = low_rank_fast_mlp_grad(*state, keys, values, *typed_base_state)
+    low_rank_scale = 1.0 / state[0].shape[1]
+    gradients = low_rank_fast_mlp_grad(
+        *state,
+        keys,
+        values,
+        *typed_base_state,
+        low_rank_scale,
+    )
     return tuple(
         (parameter - learning_rate * gradient).detach()
         for parameter, gradient in zip(state, gradients, strict=True)
@@ -305,7 +303,6 @@ class TTTFastWeightLayer(nn.Module):
                     device=self.initial_first_weight.device,
                     dtype=self.initial_first_weight.dtype,
                 ),
-                torch.zeros_like(self.initial_first_bias),
                 self.initial_first_weight[:rank, :].T.detach().clone(),
                 torch.zeros(
                     rank,
@@ -313,7 +310,6 @@ class TTTFastWeightLayer(nn.Module):
                     device=self.initial_first_weight.device,
                     dtype=self.initial_first_weight.dtype,
                 ),
-                torch.zeros_like(self.initial_second_bias),
             )
             if self.config.fast_state_dtype == "float32":
                 return LowRankFastWeightLayerState(
@@ -388,7 +384,12 @@ class TTTFastWeightLayer(nn.Module):
         typed_state = tuple(tensor.to(queries.dtype) for tensor in state)
         if self.config.low_rank is not None:
             typed_base_state = tuple(tensor.to(queries.dtype) for tensor in self._base_state())
-            return low_rank_fast_mlp_forward(queries, *typed_base_state, *typed_state)
+            return low_rank_fast_mlp_forward(
+                queries,
+                *typed_base_state,
+                *typed_state,
+                1.0 / self.config.low_rank,
+            )
         return fast_mlp_forward(queries, *typed_state)
 
     def update_apply_tensors(
@@ -450,8 +451,6 @@ class TTTFastWeightStack(nn.Module):
         else:
             fast_parameters_per_layer = (
                 2 * self.config.low_rank * (self.config.fast_hidden_size + self.config.width)
-                + self.config.fast_hidden_size
-                + self.config.width
             )
         return {
             **dataclasses.asdict(self.config),
@@ -462,7 +461,7 @@ class TTTFastWeightStack(nn.Module):
 
     @property
     def state_tensors_per_layer(self) -> int:
-        return 6 if self.config.low_rank is not None else 4
+        return 4
 
 
 class TTTSession:

@@ -139,12 +139,12 @@ def test_flat_tensor_state_threading_and_fp32_master() -> None:
         torch.testing.assert_close(actual, expected)
 
 
-def test_low_rank_delta_uses_six_tensors_and_updates() -> None:
+def test_low_rank_delta_uses_factor_tensors_and_updates() -> None:
     full_stack = make_stack()
     low_rank_stack = TTTFastWeightStack(dataclasses.replace(full_stack.config, low_rank=2))
     session = TTTSession(low_rank_stack)
     initial = session.flat_states()
-    assert len(initial) == low_rank_stack.config.layer_count * 6
+    assert len(initial) == low_rank_stack.config.layer_count * 4
 
     request = session.start_request(
         "observation-0",
