@@ -258,6 +258,8 @@ class TTTFastWeightLayer(nn.Module):
         use_register_tokens: bool,
         gate_zero: bool,
     ) -> torch.Tensor:
+        if gate_zero:
+            return hidden_states
         tokens = self._tokens_with_registers(hidden_states, use_register_tokens)
         queries = self.query_projection(tokens)
         apply_state = tuple(tensor.to(queries.dtype) for tensor in state)
