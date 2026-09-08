@@ -8,7 +8,6 @@ from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
 
-from openpi.models_pytorch.ttt_fast_weight import FastWeightTensors
 from openpi.models_pytorch.ttt_fast_weight import TTTFastWeightStack
 from openpi.models_pytorch.ttt_fast_weight import TTTRequest
 
@@ -201,8 +200,9 @@ class PaliGemmaWithExpertModel(nn.Module):
             )
             hidden_states = modeling_gemma._gated_residual(residual, hidden_states, attention_gate)  # noqa: SLF001
 
-            state_offset = layer_index * 4
-            layer_state: FastWeightTensors = fast_states[state_offset : state_offset + 4]
+            tensors_per_layer = ttt_stack.state_tensors_per_layer
+            state_offset = layer_index * tensors_per_layer
+            layer_state = fast_states[state_offset : state_offset + tensors_per_layer]
             if layer_index < layer_limit:
                 ttt_layer = ttt_stack.layers[layer_index]
                 if update_fast_weights:

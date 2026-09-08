@@ -16,6 +16,15 @@ from torch import nn
 import torch.nn.functional as F  # noqa: N812
 
 FastWeightTensors = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+LowRankFastWeightTensors = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+FastStateTensors = tuple[torch.Tensor, ...]
 FAST_HIDDEN_ABLATION_RATIOS: tuple[tuple[str, float], ...] = (
     ("hidden_4096_equivalent", 1.0),
     ("hidden_2048_equivalent", 0.5),
@@ -39,6 +48,7 @@ class TTTConfig:
     gate_init: float = 0.001
     initialization_seed: int = 20260907
     fast_state_dtype: str = "model"
+    low_rank: int | None = None
 
     @classmethod
     def from_action_expert_config(cls, action_expert_config: object) -> "TTTConfig":
@@ -67,6 +77,8 @@ class TTTConfig:
             raise ValueError("TTT inner learning rate must be positive")
         if self.fast_state_dtype not in {"model", "float32"}:
             raise ValueError("fast_state_dtype must be 'model' or 'float32'")
+        if self.low_rank is not None and not 0 < self.low_rank <= min(self.width, self.fast_hidden_size):
+            raise ValueError("low_rank must be positive and no larger than TTT dimensions")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,6 +93,29 @@ class FastWeightLayerState:
 
     def detached_clone(self) -> "FastWeightLayerState":
         return FastWeightLayerState(*(tensor.detach().clone() for tensor in self.tensors()))
+
+
+@dataclasses.dataclass(frozen=True)
+class LowRankFastWeightLayerState:
+    first_left: torch.Tensor
+    first_right: torch.Tensor
+    first_bias_delta: torch.Tensor
+    second_left: torch.Tensor
+    second_right: torch.Tensor
+    second_bias_delta: torch.Tensor
+
+    def tensors(self) -> LowRankFastWeightTensors:
+        return (
+            self.first_left,
+            self.first_right,
+            self.first_bias_delta,
+            self.second_left,
+            self.second_right,
+            self.second_bias_delta,
+        )
+
+    def detached_clone(self) -> "LowRankFastWeightLayerState":
+        return LowRankFastWeightLayerState(*(tensor.detach().clone() for tensor in self.tensors()))
 
 
 def fast_mlp_forward(
@@ -119,6 +154,77 @@ def update_fast_state(
     keys = keys.to(state_dtype)
     values = values.to(state_dtype)
     gradients = fast_mlp_grad(*state, keys, values)
+    return tuple(
+        (parameter - learning_rate * gradient).detach()
+        for parameter, gradient in zip(state, gradients, strict=True)
+    )
+
+
+def low_rank_fast_mlp_forward(
+    tokens: torch.Tensor,
+    base_first_weight: torch.Tensor,
+    base_first_bias: torch.Tensor,
+    base_second_weight: torch.Tensor,
+    base_second_bias: torch.Tensor,
+    first_left: torch.Tensor,
+    first_right: torch.Tensor,
+    first_bias_delta: torch.Tensor,
+    second_left: torch.Tensor,
+    second_right: torch.Tensor,
+    second_bias_delta: torch.Tensor,
+) -> torch.Tensor:
+    hidden = F.linear(tokens, base_first_weight, base_first_bias + first_bias_delta)
+    hidden = hidden + F.linear(F.linear(tokens, first_right), first_left)
+    hidden = F.gelu(hidden)
+    output = F.linear(hidden, base_second_weight, base_second_bias + second_bias_delta)
+    return output + F.linear(F.linear(hidden, second_right), second_left)
+
+
+def low_rank_fast_mlp_loss(
+    first_left: torch.Tensor,
+    first_right: torch.Tensor,
+    first_bias_delta: torch.Tensor,
+    second_left: torch.Tensor,
+    second_right: torch.Tensor,
+    second_bias_delta: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    base_first_weight: torch.Tensor,
+    base_first_bias: torch.Tensor,
+    base_second_weight: torch.Tensor,
+    base_second_bias: torch.Tensor,
+) -> torch.Tensor:
+    predictions = low_rank_fast_mlp_forward(
+        keys,
+        base_first_weight,
+        base_first_bias,
+        base_second_weight,
+        base_second_bias,
+        first_left,
+        first_right,
+        first_bias_delta,
+        second_left,
+        second_right,
+        second_bias_delta,
+    )
+    return F.mse_loss(predictions.float(), values.float())
+
+
+low_rank_fast_mlp_grad = torch.func.grad(low_rank_fast_mlp_loss, argnums=(0, 1, 2, 3, 4, 5))
+
+
+def update_low_rank_fast_state(
+    state: LowRankFastWeightTensors,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    base_state: FastWeightTensors,
+    learning_rate: float,
+) -> LowRankFastWeightTensors:
+    state_dtype = state[0].dtype
+    keys = keys.to(state_dtype)
+    values = values.to(state_dtype)
+    typed_base_state = tuple(tensor.to(state_dtype) for tensor in base_state)
+    gradients = low_rank_fast_mlp_grad(*state, keys, values, *typed_base_state)
     return tuple(
         (parameter - learning_rate * gradient).detach()
         for parameter, gradient in zip(state, gradients, strict=True)
@@ -188,7 +294,32 @@ class TTTFastWeightLayer(nn.Module):
                 generator=generator,
             )
 
-    def initial_state(self) -> FastWeightLayerState:
+    def initial_state(self) -> FastWeightLayerState | LowRankFastWeightLayerState:
+        if self.config.low_rank is not None:
+            rank = self.config.low_rank
+            low_rank_state = LowRankFastWeightLayerState(
+                self.initial_first_weight[:, :rank].detach().clone(),
+                torch.zeros(
+                    rank,
+                    self.config.width,
+                    device=self.initial_first_weight.device,
+                    dtype=self.initial_first_weight.dtype,
+                ),
+                torch.zeros_like(self.initial_first_bias),
+                self.initial_first_weight[:rank, :].T.detach().clone(),
+                torch.zeros(
+                    rank,
+                    self.config.fast_hidden_size,
+                    device=self.initial_first_weight.device,
+                    dtype=self.initial_first_weight.dtype,
+                ),
+                torch.zeros_like(self.initial_second_bias),
+            )
+            if self.config.fast_state_dtype == "float32":
+                return LowRankFastWeightLayerState(
+                    *(tensor.float() for tensor in low_rank_state.tensors())
+                )
+            return low_rank_state
         state = FastWeightLayerState(
             self.initial_first_weight.detach().clone(),
             self.initial_first_bias.detach().clone(),
@@ -212,49 +343,80 @@ class TTTFastWeightLayer(nn.Module):
     def update(
         self,
         hidden_states: torch.Tensor,
-        state: FastWeightLayerState,
+        state: FastWeightLayerState | LowRankFastWeightLayerState,
         use_register_tokens: bool,
-    ) -> FastWeightLayerState:
+    ) -> FastWeightLayerState | LowRankFastWeightLayerState:
         tokens = self._tokens_with_registers(hidden_states, use_register_tokens)
         with torch.no_grad():
             keys = self.key_projection(tokens).detach()
             values = self.value_projection(tokens).detach()
-        return FastWeightLayerState(
-            *update_fast_state(state.tensors(), keys, values, self.config.inner_learning_rate)
-        )
+        if isinstance(state, LowRankFastWeightLayerState):
+            return LowRankFastWeightLayerState(
+                *update_low_rank_fast_state(
+                    state.tensors(),
+                    keys,
+                    values,
+                    self._base_state(),
+                    self.config.inner_learning_rate,
+                )
+            )
+        return FastWeightLayerState(*update_fast_state(state.tensors(), keys, values, self.config.inner_learning_rate))
 
     def apply(
         self,
         hidden_states: torch.Tensor,
-        state: FastWeightLayerState,
+        state: FastWeightLayerState | LowRankFastWeightLayerState,
         use_register_tokens: bool,
         gate_zero: bool,
     ) -> torch.Tensor:
         tokens = self._tokens_with_registers(hidden_states, use_register_tokens)
         queries = self.query_projection(tokens)
-        apply_state = tuple(tensor.to(queries.dtype) for tensor in state.tensors())
-        fast_output = fast_mlp_forward(queries, *apply_state)[:, : hidden_states.shape[1]]
+        fast_output = self._apply_fast_mlp(queries, state.tensors())[:, : hidden_states.shape[1]]
         gate = torch.zeros_like(self.gate) if gate_zero else self.gate
         output = hidden_states + torch.tanh(gate) * fast_output
         return output.detach()
 
+    def _base_state(self) -> FastWeightTensors:
+        return (
+            self.initial_first_weight,
+            self.initial_first_bias,
+            self.initial_second_weight,
+            self.initial_second_bias,
+        )
+
+    def _apply_fast_mlp(self, queries: torch.Tensor, state: FastStateTensors) -> torch.Tensor:
+        typed_state = tuple(tensor.to(queries.dtype) for tensor in state)
+        if self.config.low_rank is not None:
+            typed_base_state = tuple(tensor.to(queries.dtype) for tensor in self._base_state())
+            return low_rank_fast_mlp_forward(queries, *typed_base_state, *typed_state)
+        return fast_mlp_forward(queries, *typed_state)
+
     def update_apply_tensors(
         self,
         hidden_states: torch.Tensor,
-        state: FastWeightTensors,
+        state: FastStateTensors,
         use_register_tokens: bool,
         gate_zero: bool,
-    ) -> tuple[torch.Tensor, FastWeightTensors]:
+    ) -> tuple[torch.Tensor, FastStateTensors]:
         tokens = self._tokens_with_registers(hidden_states, use_register_tokens)
         keys = self.key_projection(tokens).detach()
         values = self.value_projection(tokens).detach()
-        new_state = update_fast_state(state, keys, values, self.config.inner_learning_rate)
+        if self.config.low_rank is not None:
+            new_state = update_low_rank_fast_state(
+                state,
+                keys,
+                values,
+                self._base_state(),
+                self.config.inner_learning_rate,
+            )
+        else:
+            new_state = update_fast_state(state, keys, values, self.config.inner_learning_rate)
         return self.apply_only_tensors(hidden_states, new_state, use_register_tokens, gate_zero), new_state
 
     def apply_only_tensors(
         self,
         hidden_states: torch.Tensor,
-        state: FastWeightTensors,
+        state: FastStateTensors,
         use_register_tokens: bool,
         gate_zero: bool,
     ) -> torch.Tensor:
@@ -262,8 +424,7 @@ class TTTFastWeightLayer(nn.Module):
             return hidden_states
         tokens = self._tokens_with_registers(hidden_states, use_register_tokens)
         queries = self.query_projection(tokens)
-        apply_state = tuple(tensor.to(queries.dtype) for tensor in state)
-        fast_output = fast_mlp_forward(queries, *apply_state)[:, : hidden_states.shape[1]]
+        fast_output = self._apply_fast_mlp(queries, state)[:, : hidden_states.shape[1]]
         gate = torch.zeros_like(self.gate) if gate_zero else self.gate
         return (hidden_states + torch.tanh(gate) * fast_output).detach()
 
@@ -275,21 +436,33 @@ class TTTFastWeightStack(nn.Module):
         self.config = config
         self.layers = nn.ModuleList(TTTFastWeightLayer(config, index) for index in range(config.layer_count))
 
-    def initial_states(self) -> list[FastWeightLayerState]:
+    def initial_states(self) -> list[FastWeightLayerState | LowRankFastWeightLayerState]:
         return [layer.initial_state() for layer in self.layers]
 
     def effective_config(self) -> dict[str, int | float]:
-        fast_parameters_per_layer = (
-            self.config.fast_hidden_size * self.config.width
-            + self.config.fast_hidden_size
-            + self.config.width * self.config.fast_hidden_size
-            + self.config.width
-        )
+        if self.config.low_rank is None:
+            fast_parameters_per_layer = (
+                self.config.fast_hidden_size * self.config.width
+                + self.config.fast_hidden_size
+                + self.config.width * self.config.fast_hidden_size
+                + self.config.width
+            )
+        else:
+            fast_parameters_per_layer = (
+                2 * self.config.low_rank * (self.config.fast_hidden_size + self.config.width)
+                + self.config.fast_hidden_size
+                + self.config.width
+            )
         return {
             **dataclasses.asdict(self.config),
             "fast_parameters_per_layer": fast_parameters_per_layer,
             "fast_parameters_total": fast_parameters_per_layer * self.config.layer_count,
+            "state_tensors_per_layer": self.state_tensors_per_layer,
         }
+
+    @property
+    def state_tensors_per_layer(self) -> int:
+        return 6 if self.config.low_rank is not None else 4
 
 
 class TTTSession:
@@ -309,12 +482,18 @@ class TTTSession:
         return tuple(tensor for state in self.states for tensor in state.tensors())
 
     def replace_flat_states(self, tensors: tuple[torch.Tensor, ...]) -> None:
-        expected = self.stack.config.layer_count * 4
+        tensors_per_layer = self.stack.state_tensors_per_layer
+        expected = self.stack.config.layer_count * tensors_per_layer
         if len(tensors) != expected:
             raise ValueError(f"Expected {expected} fast-state tensors, got {len(tensors)}")
+        state_type = (
+            LowRankFastWeightLayerState
+            if self.stack.config.low_rank is not None
+            else FastWeightLayerState
+        )
         self.states = [
-            FastWeightLayerState(*tensors[index : index + 4])
-            for index in range(0, expected, 4)
+            state_type(*tensors[index : index + tensors_per_layer])
+            for index in range(0, expected, tensors_per_layer)
         ]
 
     def start_request(

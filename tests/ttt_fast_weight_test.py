@@ -139,6 +139,31 @@ def test_flat_tensor_state_threading_and_fp32_master() -> None:
         torch.testing.assert_close(actual, expected)
 
 
+def test_low_rank_delta_uses_six_tensors_and_updates() -> None:
+    full_stack = make_stack()
+    low_rank_stack = TTTFastWeightStack(dataclasses.replace(full_stack.config, low_rank=2))
+    session = TTTSession(low_rank_stack)
+    initial = session.flat_states()
+    assert len(initial) == low_rank_stack.config.layer_count * 6
+
+    request = session.start_request(
+        "observation-0",
+        TTTUpdateMode.EVERY_PASS,
+        low_rank_stack.config.layer_count,
+        use_register_tokens=True,
+    )
+    hidden = torch.randn(1, 3, low_rank_stack.config.width)
+    for layer_index in range(low_rank_stack.config.layer_count):
+        hidden = request.process_layer(layer_index, hidden)
+
+    assert torch.isfinite(hidden).all()
+    assert any(not torch.equal(before, after) for before, after in zip(initial, session.flat_states(), strict=True))
+    assert (
+        low_rank_stack.effective_config()["fast_parameters_total"]
+        < full_stack.effective_config()["fast_parameters_total"]
+    )
+
+
 def test_layer_states_are_independent_and_reset_is_reproducible() -> None:
     stack = make_stack()
     session = TTTSession(stack)
